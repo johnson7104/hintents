@@ -38,7 +38,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::time::Duration;
 use tracing_subscriber::{fmt, EnvFilter};
 
 // Use types::SimulationRequest directly
@@ -87,6 +88,35 @@ fn send_error(msg: String) {
     };
     ipc::response::emit_response(&res);
     std::process::exit(1);
+}
+
+fn emit_runner_error(error: runner::SimHostError) {
+    let error_code = if matches!(error, runner::SimHostError::Timeout { .. }) {
+        "TIMEOUT"
+    } else {
+        "RUNNER_ERROR"
+    };
+    let response = SimulationResponse {
+        status: "error".to_string(),
+        error: Some(error.to_string()),
+        error_code: Some(error_code.to_string()),
+        lcov_report: None,
+        lcov_report_path: None,
+        events: vec![],
+        diagnostic_events: vec![],
+        categorized_events: vec![],
+        logs: vec![],
+        flamegraph: None,
+        optimization_report: None,
+        budget_usage: None,
+        source_location: None,
+        stack_trace: None,
+        wasm_offset: None,
+        linear_memory_dump: None,
+        asset_anomalies: vec![],
+        pprof_profile: None,
+    };
+    ipc::response::emit_response(&response);
 }
 
 fn panic_info_to_string(panic_info: &(dyn Any + Send)) -> String {
@@ -433,13 +463,8 @@ fn main() {
 
     tracing::info!(event = "simulator_started", "Simulator initializing...");
 
-    let mut pprof_guard = profiler::PprofGuard::start(99);
-
     let mut buffer = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut buffer) {
-        let pprof_b64 = pprof_guard
-            .stop()
-            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(&bytes));
         let res = SimulationResponse {
             status: "error".to_string(),
             error: Some(format!("Failed to read stdin: {e}")),
@@ -458,12 +483,40 @@ fn main() {
             wasm_offset: None,
             linear_memory_dump: None,
             asset_anomalies: vec![],
-            pprof_profile: pprof_b64,
+            pprof_profile: None,
         };
         tracing::error!("Failed to read stdin: {}", e);
         ipc::response::emit_response(&res);
         return;
     }
+
+    if !runner::is_timeout_worker() {
+        let timeout = env::var("ERST_SIM_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| runner::RunnerConfig::default().timeout());
+        let config = runner::RunnerConfig::default().with_timeout(timeout);
+
+        match runner::run_request_with_timeout(&buffer, config) {
+            Ok(output) => {
+                if let Err(error) = io::stdout().lock().write_all(&output.stdout) {
+                    eprintln!("failed to forward simulator response: {error}");
+                    std::process::exit(1);
+                }
+                if !output.status.success() {
+                    std::process::exit(output.status.code().unwrap_or(1));
+                }
+            }
+            Err(error) => {
+                emit_runner_error(error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let mut pprof_guard = profiler::PprofGuard::start(99);
 
     let request: SimulationRequest = match serde_json::from_str(&buffer) {
         Ok(req) => req,
